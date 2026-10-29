@@ -182,8 +182,8 @@ node --check src/index.js
 发布前会跑语法检查 + 13 项测试，并检查 registry 上是否已有同版本（有就失败）。
 需要仓库 secret：`NPM_TOKEN`（npm 的 **Automation** token，绕过 2FA）。
 
-`.github/workflows/publish-oidc.yml` 是等价的 **OIDC / Trusted Publishing** 版本，不需要任何 secret
-（首次发布仍需 token 先把包名占下来）。两者二选一启用。
+认证走 **Trusted Publisher (OIDC) 优先、`NPM_TOKEN` 兜底**：先清空 token 让 npm 用 GitHub OIDC
+换短期凭证，失败再回退 secret。首次发布（包还不存在时）必须靠 `NPM_TOKEN`。
 
 ---
 

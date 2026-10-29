@@ -10,8 +10,8 @@
 | --- | --- | --- |
 | `oc-purge` 包已存在于 npm | ❌ **不存在**（registry 返回 404） | OIDC 不能创建新包 |
 | Trusted Publisher 已绑定 | ❌ 未配置 | 包不存在时页面上没有这个入口 |
-| `id-token: write` | ✅ 已有 | 在 `publish-oidc.yml` |
-| 仓库 public + workflow 文件名 | ✅ 已有 | `6zev/oc-purge` / `publish-oidc.yml` |
+| `id-token: write` | ✅ 已有 | 在 `publish.yml` |
+| 仓库 public + workflow 文件名 | ✅ 已有 | `6zev/oc-purge` / `publish.yml` |
 
 ## 必须按这个顺序做
 
@@ -46,19 +46,26 @@ https://www.npmjs.com/package/oc-purge/settings
   → Trusted Publishing
       Owner:                    6zev
       Repository:               oc-purge
-      Workflow filename:        publish-oidc.yml
+      Workflow filename:        publish.yml
       Environment:              (留空)
   → Add
 ```
 
 > 包不存在时这个卡片根本不出现 —— 这是“扣在第 1 步”的原因。
 
-### 第 3 步：切到 OIDC，删掉 token
+### 第 3 步：确认 OIDC 生效，可选删掉 token
+
+`publish.yml` 已经内置「OIDC 优先、token 兜底」，不需要切文件。验证方式：看运行日志有没有
+
+```
+##[notice]attempt 1/2 — OIDC trusted publishing
+```
+
+有，且后面没有 `falling back to NPM_TOKEN`，说明走的是 OIDC。
+确认稳定后可以删掉长期凭证：
 
 ```bash
-gh workflow disable "Publish to npm" --repo 6zev/oc-purge       # 关掉 token 版
-gh secret delete NPM_TOKEN --repo 6zev/oc-purge                  # 删掉长期凭证
-git tag v0.2.2 && git push origin v0.2.2                         # OIDC 版自动接手
+gh secret delete NPM_TOKEN --repo 6zev/oc-purge
 ```
 
 ## 常见误判

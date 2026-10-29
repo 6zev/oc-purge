@@ -25,11 +25,11 @@ npm 页面：`https://www.npmjs.com/package/oc-purge/settings` → Trusted Publi
 ```
 Owner:      6zev
 Repo:       oc-purge
-Workflow:   publish-oidc.yml
+Workflow:   publish.yml
 ```
 
 workflow 里必须有 `permissions: id-token: write`，且 `npm publish` 不带任何 `NODE_AUTH_TOKEN`。
-见 `.github/workflows/publish-oidc.yml`。
+本仓库的 `publish.yml` 已内置这个顺序（OIDC 优先 → token 兜底），不需要额外的 workflow 文件。
 
 > ⚠️ 首次发布**必须**用 token。OIDC 只能接管已存在的包。
 
@@ -75,8 +75,8 @@ npm publish --access public --provenance
 
 ## 四、本仓库的现状
 
-- `publish.yml` —— token 认证（#2），A/B/C 三触发
-- `publish-oidc.yml` —— OIDC 认证（#4），同样三触发，**二选一启用**
+- `publish.yml` —— **OIDC（#4）优先 + token（#2）兜底**，A/B/C 三触发，单一 workflow
+- `publish-oidc.yml` —— 已删除（功能合并进 `publish.yml`，避免同一次 Release 发两遍）
 
 实测记录：`publish.yml` 手动触发一次，前 9 步全通，最后 `ENEEDAUTH`（未配 token），
 说明流程正确、只差凭证。
