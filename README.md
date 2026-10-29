@@ -169,7 +169,9 @@ node --check src/index.js
 
 ## 发布
 
-`.github/workflows/publish.yml`，三条触发路径：
+完整选项（认证方式 × 触发方式 × 第三方工具）见 [docs/PUBLISH.md](docs/PUBLISH.md)。
+
+`.github/workflows/publish.yml`（token 认证），三条触发路径：
 
 | 触发 | 版本来源 |
 | --- | --- |
@@ -179,6 +181,9 @@ node --check src/index.js
 
 发布前会跑语法检查 + 13 项测试，并检查 registry 上是否已有同版本（有就失败）。
 需要仓库 secret：`NPM_TOKEN`（npm 的 **Automation** token，绕过 2FA）。
+
+`.github/workflows/publish-oidc.yml` 是等价的 **OIDC / Trusted Publishing** 版本，不需要任何 secret
+（首次发布仍需 token 先把包名占下来）。两者二选一启用。
 
 ---
 

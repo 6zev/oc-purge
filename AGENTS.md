@@ -30,8 +30,10 @@ node --check src/index.js
 
 ## 发布
 
-`.github/workflows/publish.yml` 三路触发：GitHub Release / `v*` tag / 手动 Run workflow。
-需要仓库 secret `NPM_TOKEN`（npm 的 Automation token）。
+`.github/workflows/publish.yml` 三路触发：GitHub Release / `v*` tag / 手动 Run workflow，
+需要 secret `NPM_TOKEN`（Automation token）。
+`.github/workflows/publish-oidc.yml` 是等价的 OIDC 版本（无需 secret，首次仍需 token），二者二选一。
+全部发布方式的对照见 `docs/PUBLISH.md`。
 
 真机验证（需要 2.2.0 二进制）：
 
