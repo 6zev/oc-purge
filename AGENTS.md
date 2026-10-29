@@ -21,9 +21,17 @@
 ## 命令
 
 ```bash
-node --test test/*.test.mjs     # 13 项，全绿才算可发布
+npm test                        # 13 项，全绿才算可发布（内置 @opencode/plugin 替身）
 node --check src/index.js
 ```
+
+`npm test` 通过 `test/register-stubs.mjs` 把 `@opencode/plugin` 解析到 `test/stubs/`，
+所以只需要 `effect` 一个依赖，不必装整个 OpenCode 宿主。
+
+## 发布
+
+`.github/workflows/publish.yml` 三路触发：GitHub Release / `v*` tag / 手动 Run workflow。
+需要仓库 secret `NPM_TOKEN`（npm 的 Automation token）。
 
 真机验证（需要 2.2.0 二进制）：
 

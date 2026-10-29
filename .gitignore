@@ -1,3 +1,5 @@
 node_modules/
 test/.ocpurge-home*/
 .ocpurge-home*/
+package-lock.json
+*.tgz

@@ -44,6 +44,9 @@
     }
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --import ./test/register-stubs.mjs --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "effect": "^4.0.0"
   }
 }

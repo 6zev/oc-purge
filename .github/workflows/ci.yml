@@ -13,10 +13,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install peer deps (for tests only)
+      - name: Install dev deps (effect, for tests only)
         run: npm install --no-save effect@^4.0.0
       - name: Syntax check
         run: |
           for f in src/*.js legacy/*.js; do node --check "$f"; done
       - name: Test
-        run: node --test test/*.test.mjs
+        run: npm test

@@ -87,7 +87,7 @@ jobs:
           fi
           echo "$NAME@$VER 尚未发布，继续"
 
-      - name: Install peer deps (tests only)
+      - name: Install dev deps (effect, tests only)
         run: npm install --no-save effect@^4.0.0
 
       - name: Syntax check
@@ -96,7 +96,7 @@ jobs:
           for f in src/*.js legacy/*.js; do node --check "$f"; done
 
       - name: Test
-        run: node --test test/*.test.mjs
+        run: npm test
 
       - name: Pack preview
         run: npm pack --dry-run

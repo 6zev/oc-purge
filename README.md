@@ -159,11 +159,26 @@ oc-purge/
 ## 开发
 
 ```bash
-node --test test/*.test.mjs     # 13 项
+npm install        # 只装 effect
+npm test           # 13 项
 node --check src/index.js
 ```
 
-`test/harness.mjs` 是按 `packages/core/src/plugin/host.ts` 语义写的宿主替身，所以不需要装 opencode 也能跑。
+`test/harness.mjs` 是按 `packages/core/src/plugin/host.ts` 语义写的宿主替身；
+`test/register-stubs.mjs` 把 `@opencode/plugin` 解析到 `test/stubs/`，所以不需要装 opencode 也能跑。
+
+## 发布
+
+`.github/workflows/publish.yml`，三条触发路径：
+
+| 触发 | 版本来源 |
+| --- | --- |
+| 发 GitHub Release | Release 的 tag 名（`v0.2.1` → `0.2.1`） |
+| push `v*` tag | tag 名 |
+| 手动 Run workflow | 自动 patch / minor / major，发完把版本号 commit 回 main |
+
+发布前会跑语法检查 + 13 项测试，并检查 registry 上是否已有同版本（有就失败）。
+需要仓库 secret：`NPM_TOKEN`（npm 的 **Automation** token，绕过 2FA）。
 
 ---
 
