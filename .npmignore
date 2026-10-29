@@ -1,0 +1,5 @@
+test/
+AGENTS.md
+.github/
+.gitignore
+*.tgz

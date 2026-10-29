@@ -12,6 +12,25 @@
 
 ## 安装
 
+### 从 npm（最省事）
+
+```bash
+npm i -g oc-purge          # 或装在任意可解析的目录
+```
+
+```json
+// ~/.config/opencode/opencode.json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    { "package": "oc-purge", "options": { "verbose": true } }
+  ]
+}
+```
+
+> OpenCode 会自己解析包名并读 `exports["."]`。不要写 `npm:` 前缀。
+
+
 ### 2.2.0（推荐）
 
 ```json

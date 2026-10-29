@@ -1,0 +1,130 @@
+name: Publish to npm
+
+# 触发方式（三选一）：
+#   1. 发 GitHub Release      → 用 tag 名当版本（v0.2.1 → 0.2.1）
+#   2. 手动 Run workflow      → 自动把 patch 位 +1
+#   3. push 一个 v* tag       → 同 1
+on:
+  release:
+    types: [published]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "版本递增方式（release/tag 触发时忽略，以 tag 名为准）"
+        type: choice
+        default: patch
+        options: [patch, minor, major]
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # 写回版本号 + 创建 tag
+  id-token: write # npm provenance（可选但推荐）
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT=$(node -p "require('./package.json').version")
+          case "${GITHUB_REF_TYPE:-}" in
+            tag)
+              NEXT="${GITHUB_REF_NAME#v}"
+              SOURCE="tag ${GITHUB_REF_NAME}"
+              ;;
+            *)
+              if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+                NEXT="${GITHUB_REF_NAME#v}"
+                SOURCE="release ${GITHUB_REF_NAME}"
+              else
+                NEXT=$(npm version "${{ inputs.bump }}" --no-git-tag-version --silent | sed 's/^v//')
+                SOURCE="bump ${{ inputs.bump }}"
+              fi
+              ;;
+          esac
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT"     >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "Resolved: $CURRENT → $NEXT ($SOURCE)"
+
+      - name: Sync package.json version
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEXT="${{ steps.ver.outputs.next }}"
+          CURRENT="${{ steps.ver.outputs.current }}"
+          if [ "$NEXT" != "$CURRENT" ]; then
+            npm version "$NEXT" --no-git-tag-version --allow-same-version
+          fi
+          node -p "'publishing ' + require('./package.json').name + '@' + require('./package.json').version"
+
+      - name: Guard against already-published version
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./package.json').name")
+          VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "::error::$NAME@$VER 已存在于 registry，换版本再发"
+            exit 1
+          fi
+          echo "$NAME@$VER 尚未发布，继续"
+
+      - name: Install peer deps (tests only)
+        run: npm install --no-save effect@^4.0.0
+
+      - name: Syntax check
+        shell: bash
+        run: |
+          for f in src/*.js legacy/*.js; do node --check "$f"; done
+
+      - name: Test
+        run: node --test test/*.test.mjs
+
+      - name: Pack preview
+        run: npm pack --dry-run
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - name: Commit version bump back
+        if: github.event_name == 'workflow_dispatch' && steps.ver.outputs.next != steps.ver.outputs.current
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore(release): v${{ steps.ver.outputs.next }} [skip ci]"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| package | \`$(node -p "require('./package.json').name")@$(node -p "require('./package.json').version")\` |"
+            echo "| source | $(echo '${{ steps.ver.outputs.source }}') |"
+            echo "| registry | https://www.npmjs.com/package/$(node -p "require('./package.json').name") |"
+          } >> "$GITHUB_STEP_SUMMARY"
