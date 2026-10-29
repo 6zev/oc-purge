@@ -78,3 +78,45 @@ git tag v0.2.2 && git push origin v0.2.2                         # OIDC 版自�
 2. 之后每次发布前 `npm login` 本地手动发，或继续用 `publish.yml` + token。
 
 OIDC 的收益是“没有长期凭证可泄露”，代价是必须先发一次。
+
+---
+
+## 六、Trusted Publisher 的「幽灵发布」（ghost publish）
+
+npm 的 Trusted Publisher 有个特性：**验证之前的那一次 publish，实际已经发布成功，但 npm 返回错误。**
+
+表现：
+
+```
+npm notice Publishing to https://registry.npmjs.org/
+npm notice Signed provenance statement with source and build information from GitHub Actions
+npm error 404 Not Found - PUT https://registry.npmjs.org/<pkg>
+npm error 404  '<pkg>@<ver>' is not in this registry.
+```
+
+看起来失败，但 registry 上其实已经有了。所以：
+
+- **每次「失败」后先查** `npm view <pkg> <ver>` 或网页刷新，别急着重发
+- 重发会撞 `E403 You cannot publish over the previously published versions`
+- 验证窗口 7 天（页面显示 `Publish once before <日期> to validate`），超时就要重新绑
+
+本仓库的 `publish.yml` 已经处理了这个情况：
+
+1. 先走 OIDC（清空所有 token）
+2. 失败且 registry 上出现了这个版本 → 判定为幽灵发布，**判成功**
+3. 失败且 registry 上没有 → 回退 `NPM_TOKEN` 再发一次
+
+## 七、staged publishing（`0.0.0-stage`）
+
+如果 `npm view <pkg> dist-tags` 显示 `latest: 0.0.0-stage`，说明这次发布走了 npm 的
+**staged publish** 流程：先建一个占位版本文档，真版本要人工 release。
+
+两种解法：
+
+| 解法 | 操作 |
+| --- | --- |
+| 关掉 staging | `npm config set staging false`，或 publish 时带 `--no-staging` |
+| 手动 release | npmjs 包页面 → Staged / Publish 页签 → 选中版本 → Publish |
+
+注意：切到 OIDC 后，Trusted Publisher 的 permissions 里也要勾上 `npm stage publish`，
+否则 staged 流程会被拒。

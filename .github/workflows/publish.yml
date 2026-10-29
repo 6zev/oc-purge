@@ -1,5 +1,10 @@
 name: Publish to npm
 
+# 认证策略：
+#   - 配了 Trusted Publisher（OIDC）时：不提供 NODE_AUTH_TOKEN，npm 自动用 GitHub OIDC 换短期 token
+#   - 未配时：回退到 secret NPM_TOKEN（Automation token）
+#   - 首次发布（包不存在）必须走 NPM_TOKEN，OIDC 无法创建新包
+#
 # 触发方式（三选一）：
 #   1. 发 GitHub Release      → 用 tag 名当版本（v0.2.1 → 0.2.1）
 #   2. 手动 Run workflow      → 自动把 patch 位 +1
@@ -37,6 +42,10 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+
+      # OIDC 需要 npm >= 11.5；setup-node 自带的可能更旧
+      - name: Upgrade npm
+        run: npm install -g npm@latest
 
       - name: Resolve version
         id: ver
@@ -101,10 +110,39 @@ jobs:
       - name: Pack preview
         run: npm pack --dry-run
 
-      - name: Publish
+      # 优先走 OIDC：不注入 NODE_AUTH_TOKEN，npm 会向 GitHub 换取短期凭证。
+      # 前提是 npm 侧已绑定 Trusted Publisher，且 workflow 文件名匹配（publish.yml）。
+      # 优先 OIDC：清掉所有 token，npm 会用 GitHub OIDC 换 15 分钟凭证。
+      # Trusted Publisher 未验证时第一次会失败（幽灵发布），此时回退到 NPM_TOKEN。
+      - name: Publish (OIDC preferred, token fallback)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./package.json').name")
+          VER=$(node -p "require('./package.json').version")
+
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::notice::attempt 1/2 — OIDC trusted publishing"
+            if env -u NODE_AUTH_TOKEN -u NPM_TOKEN npm publish --access public --provenance; then
+              echo "::notice::published via OIDC"
+              exit 0
+            fi
+            echo "::warning::OIDC publish failed — falling back to NPM_TOKEN"
+          fi
+
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            echo "::notice::attempt 2/2 — NPM_TOKEN"
+            NODE_AUTH_TOKEN="$NPM_TOKEN" npm publish --access public --provenance && exit 0
+          fi
+
+          # 两种都失败时，判断是不是「其实已经发出去了」
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "::notice::$NAME@$VER 已存在于 registry（很可能第一条 OIDC 路径的幽灵发布成功了）"
+            exit 0
+          fi
+          echo "::error::publish failed and $NAME@$VER not on registry"
+          exit 1
 
       - name: Commit version bump back
         if: github.event_name == 'workflow_dispatch' && steps.ver.outputs.next != steps.ver.outputs.current
@@ -116,6 +154,16 @@ jobs:
           git add package.json
           git commit -m "chore(release): v${{ steps.ver.outputs.next }} [skip ci]"
           git push origin HEAD:${{ github.ref_name }}
+
+      - name: Show registry state
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./package.json').name")
+          echo "--- dist-tags"
+          npm view "$NAME" dist-tags --json || true
+          echo "--- versions"
+          npm view "$NAME" versions --json || true
 
       - name: Summary
         run: |
