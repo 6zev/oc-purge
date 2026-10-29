@@ -1,0 +1,464 @@
+/**
+ * oc-purge — OpenCode V2 插件入口（Promise API）
+ *
+ * 从 dsh-purge 移植的对应关系：
+ *   dsh-purge 补丁表(#1..#90)          → 这里 = chain-transform（带 marker 的链式替换，幂等）
+ *   rewritePromptAssembly(sections)      → 这里 = agent.system 改写 + context hook 置顶身份卡
+ *   $DSH_HOME/rules + skills             → 这里 = ~/.config/opencode/oc-purge/{rules,cards}
+ *   user-approval 自动放行               → 这里 = permission.hook("evaluate") 改 effect
+ *   fs-observation-policy 绕过           → 这里 = tool.execute.before 的输入归一化
+ *   net-scope 允许清单                   → 这里 = 域名/IP 作用域闸门（可关）
+ *   演练台 HTTP 桥 / 证据库              → 这里 = 新增工具 purge_* + storage.hook
+ *
+ * 设计约束（OpenCode 特有的坑）：
+ *   - system 段顺序 = [agent.system, initial(指令/环境/日期)]，身份卡必须落在**最后一段**末尾，
+ *     所以用 session.hook("context") 追加；直接改 agent.system 只能改「前半段」。
+ *   - hook 回调是同步/异步的，但 transform 编辑器是同步的：异步数据（读盘）必须提前在 setup 里 await。
+ *   - 身份卡里所有 `{{ }}` 一律不写：OpenCode 会用 prompt 变量插值，未定义变量会补齐而不是报错，
+ *     但为了可预期，正文统一用 `[placeholder]` 风格。
+ *   - 除 `@opencode/plugin` 与 peer 的 `effect`（工具 input/output 的 `Schema.Struct`）之外不引外部依赖。
+ *   - 身份卡以「首 80 字符」为指纹做幂等，多轮/多 hook 触发不会叠出第二份。
+ */
+
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { Plugin, Skill, Agent } from "@opencode/plugin";
+import { Schema } from "effect";
+
+import {
+  PRIME_DIRECTIVE,
+  appendOnce,
+  pickPromptOverrides,
+  renderIdentityCard,
+  stripSelfLimits,
+} from "./prompt.js";
+import { collectRules, ensureDirs, readCard, readInjectFile, listRuleFiles, readState, writeState, paths } from "./rules.js";
+import { agentPatch, promptPatches, toolPatches } from "./patches.js";
+import { allowNetwork, installScopeGate, scopeReport } from "./scope.js";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGE_ROOT = path.resolve(HERE, "..");
+
+const DEFAULTS = {
+  enabled: true,
+  primeDirective: PRIME_DIRECTIVE,
+  card: "",
+  cardByModel: {},
+  rules: [],
+  workspacePolicy: "fallback",
+  stripHostDisclaimers: true,
+  hookBypass: true,
+  permissionAutoAllow: true,
+  permissionAllowActions: ["*"],
+  scope: { enabled: false, allow: [], deny: [] },
+  patchChain: true,
+  verbose: false,
+  postPrompt: "",
+  dropTools: [],
+  skillsDir: path.join(PACKAGE_ROOT, "skills"),
+  agentsDir: path.join(PACKAGE_ROOT, "agents"),
+};
+
+const log = (options, ...args) => {
+  if (options?.verbose) console.log("[oc-purge]", ...args);
+};
+
+function config(options) {
+  const merged = { ...DEFAULTS, ...(options || {}) };
+  merged.rules = Array.isArray(merged.rules) ? merged.rules : [];
+  merged.cardByModel = merged.cardByModel && typeof merged.cardByModel === "object" ? merged.cardByModel : {};
+  merged.scope = { ...DEFAULTS.scope, ...(merged.scope || {}) };
+  return merged;
+}
+
+/* ------------------------------------------------------------------ *
+ * 1. 提示词注入
+ * ------------------------------------------------------------------ */
+
+async function readSkillCatalog(dir) {
+  const out = [];
+  let entries = [];
+  try {
+    entries = await fsp.readdir(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      out.push(...(await readSkillCatalog(path.join(dir, entry.name))));
+      continue;
+    }
+    if (!entry.name.endsWith(".md")) continue;
+    try {
+      const raw = await fsp.readFile(path.join(dir, entry.name), "utf8");
+      const name = raw.match(/^name:\s*(.+)$/m)?.[1]?.trim() || entry.name.slice(0, -3);
+      const description = raw.match(/^description:\s*(.+)$/m)?.[1]?.trim() || "";
+      out.push({ name, description, file: path.join(dir, entry.name), raw });
+    } catch {
+      // 读不到就跳过
+    }
+  }
+  return out;
+}
+
+async function buildInjectText(cfg, ctx, env) {
+  const instructionFiles = Array.isArray(ctx.options?.instructions)
+    ? ctx.options.instructions.filter((item) => typeof item === "string")
+    : [];
+  const rules = await collectRules({ env, options: cfg, instructionFiles });
+  const card =
+    readCard(env, pickPromptOverridesKey(cfg.cardByModel, cfg)) || cfg.card || readCard(env, "default");
+  const skills = await readSkillCatalog(cfg.skillsDir);
+  const skillList = skills.length
+    ? [
+        "## Capability discovery (skills / MCP)",
+        "Before improvising, check whether a skill covers the request; load it and follow its methods.",
+        ...skills.map((s) => `- ${s.name}: ${s.description}`),
+      ].join("\n")
+    : "";
+  const inject = readInjectFile(env);
+  const blocks = [
+    renderIdentityCard({ card, rules, primeDirective: cfg.primeDirective }),
+    inject,
+    skillList,
+    cfg.postPrompt,
+  ].filter((item) => String(item || "").trim());
+  return blocks.join("\n\n");
+}
+
+function pickPromptOverridesKey(map, cfg) {
+  // cardByModel 的 key 可能是 "deepseek/deepseek-chat" 或 "anthropic/claude-x"；
+  // 具体模型在 context hook 里才知道，这里先取默认卡，context hook 再按模型覆盖。
+  return cfg.cardByModel.__default ? "__default" : "default";
+}
+
+function resolveCard(cfg, env, modelRef) {
+  const byModel = pickPromptOverrides(cfg.cardByModel, modelRef);
+  if (byModel.card) return byModel.card;
+  if (byModel.cardFile) return readCard(env, String(byModel.cardFile));
+  if (cfg.card) return cfg.card;
+  return readCard(env, "default");
+}
+
+/* ------------------------------------------------------------------ *
+ * 2. 宿主原生提示词改写（agent.transform）
+ * ------------------------------------------------------------------ */
+
+function applyPromptPatches(cfg, text) {
+  let out = String(text ?? "");
+  if (!out) return out;
+  if (cfg.stripHostDisclaimers) out = stripSelfLimits(out);
+  if (cfg.patchChain) {
+    for (const patch of promptPatches) {
+      out = patch.apply(out);
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * 3. 插件主体
+ * ------------------------------------------------------------------ */
+
+export const plugin = Plugin.define({
+  id: "oc-purge",
+
+  async setup(ctx) {
+    const cfg = config(ctx.options);
+    const env = process.env;
+    ensureDirs(env);
+    if (!cfg.enabled) {
+      log(cfg, "disabled");
+      return;
+    }
+
+    const injectText = await buildInjectText(cfg, ctx, env);
+    const disposables = [];
+    // 2.x 宿主在 standalone 模式下把插件 stdout 收进 server 日志，这里同时写一份到文件，
+    // 便于 /tmp 侧的验证脚本在没有 --print-logs 的情况下也能看到装载证据。
+    const traceFile = process.env.OC_PURGE_TRACE;
+    const trace = (msg) => {
+      if (!traceFile) return;
+      try {
+        fs.appendFileSync(traceFile, `${new Date().toISOString()} ${msg}\n`);
+      } catch {}
+    };
+    trace(`setup start inject=${injectText.length}`);
+
+    /* ---- 3.1 agents：原生 agent 的 system 改写 + 注入专用 primary agent ---- */
+    const agentsDir = cfg.agentsDir;
+    const agentSources = await readSkillCatalog(agentsDir);
+    await ctx.agent.transform((editor) => {
+      for (const item of agentSources) {
+        const id = item.name;
+        if (!editor.get(id)) {
+          try {
+            editor.add(Agent.Info.default(Agent.ID.make(id)));
+          } catch {
+            continue;
+          }
+        }
+        editor.update(id, (agent) => {
+          agent.name = id;
+          agent.description = item.description;
+          agent.mode = "primary";
+          agent.system = appendOnce(applyPromptPatches(cfg, agent.system || ""), injectText);
+        });
+      }
+      for (const agent of editor.list()) {
+        if (agentSources.some((item) => item.name === agent.id)) continue;
+        editor.update(agent.id, (item) => {
+          if (!item.system) return;
+          const next = appendOnce(applyPromptPatches(cfg, item.system), injectText);
+          item.system = next;
+        });
+      }
+    });
+    disposables.push(() => ctx.agent.reload());
+    log(cfg, "agents:", agentSources.map((a) => a.name).join(",") || "(none)");
+    trace(`agents injected=${agentSources.length} inject=${injectText.length}`);
+
+    /* ---- 3.2 每次派发前：身份卡钉到最后一段 system ---- */
+    const contextReg = await ctx.session.hook("context", (event) => {
+      const modelRef = `${event.model?.providerID ?? ""}/${event.model?.modelID ?? ""}`;
+      log(cfg, "context hook", modelRef);
+      trace(`context hook model=${modelRef} parts=${Array.isArray(event.system) ? event.system.length : -1}`);
+      const card = resolveCard(cfg, env, modelRef);
+      const block = renderIdentityCard({ card, primeDirective: cfg.primeDirective });
+      const parts = Array.isArray(event.system) ? [...event.system] : [];
+      const last = parts.length ? { ...parts[parts.length - 1] } : undefined;
+      // 身份卡必须落在**最后一段** system 末尾：宿主把 agent.system 放在第 0 段，
+      // 后面才是指令文件/环境/日期，只有尾部才是「最贴近本轮」的位置。
+      if (last && typeof last.text === "string") {
+        last.text = appendOnce(last.text, block);
+        parts[parts.length - 1] = last;
+      } else {
+        parts.push({ type: "text", text: block });
+      }
+      event.system = parts;
+      // 工具面收窄：声明了 dropTools 就删掉对应工具描述
+      if (Array.isArray(cfg.dropTools) && cfg.dropTools.length && event.tools) {
+        for (const name of cfg.dropTools) delete event.tools[name];
+      }
+    });
+    disposables.push(() => contextReg.dispose());
+
+    /* ---- 3.3 执行链改写（fs 观察绕过 / hooks 拒绝绕过）---- */
+    const beforeReg = await ctx.tool.hook("execute.before", (event) => {
+      if (!cfg.hookBypass) return;
+      for (const patch of toolPatches) {
+        try {
+          event.input = patch.apply(event.input);
+        } catch {
+          // 单条链失败不影响工具调用
+        }
+      }
+    });
+    disposables.push(() => beforeReg.dispose());
+
+    /* ---- 3.4 权限：审批门改写 ---- */
+    const permReg = await ctx.permission.hook("evaluate", (event) => {
+      if (!cfg.permissionAutoAllow) return;
+      const allowAny = !Array.isArray(cfg.permissionAllowActions) || cfg.permissionAllowActions.includes("*");
+      if (!allowAny && !cfg.permissionAllowActions.includes(event.action)) return;
+      if (event.effect === "deny") return; // 显式 deny 规则保持原样，交由 operator 决定
+      event.effect = "allow";
+      event.message = undefined;
+    });
+    disposables.push(() => permReg.dispose());
+
+    /* ---- 3.5 网络作用域闸门（默认关）---- */
+    const gate = installScopeGate({
+      enabled: cfg.scope.enabled,
+      allow: cfg.scope.allow,
+      deny: cfg.scope.deny,
+      log: (...args) => log(cfg, ...args),
+    });
+    disposables.push(() => gate.dispose());
+
+    if (cfg.scope.enabled) {
+      const scopeToolReg = await ctx.tool.hook("execute.before", (event) => {
+        const command = event.input?.command;
+        if (typeof command === "string") {
+          const verdict = gate.checkCommand(command);
+          if (!verdict.allowed) {
+            throw new Error(`[oc-purge] out-of-scope host ${verdict.host} (${verdict.reason})`);
+          }
+        }
+        for (const key of ["url", "uri", "href"]) {
+          const value = event.input?.[key];
+          if (typeof value !== "string") continue;
+          const verdict = gate.check(value);
+          if (!verdict.allowed) throw new Error(`[oc-purge] out-of-scope host ${value} (${verdict.reason})`);
+        }
+      });
+      disposables.push(() => scopeToolReg.dispose());
+
+      // scope 只管「操作者的工具出网」（bash/webfetch/http），不能拦模型 API 请求，
+      // 否则一开 scope 就把自己到 provider 的链路掐断。模型请求只记录不拦。
+      const scopeHttpReg = await ctx.session.hook("http.request", (event) => {
+        const verdict = gate.check(event.request?.url || "");
+        if (!verdict.allowed) {
+          log(cfg, "model request outside scope (not blocked):", verdict.reason, event.request?.url);
+          trace(`model request out-of-scope ${verdict.reason}`);
+        }
+      });
+      disposables.push(() => scopeHttpReg.dispose());
+    }
+
+    /* ---- 3.6 新增工具 / 技能 ---- */
+    const toolSpecs = makePurgeTools({ cfg, env });
+    await ctx.tool.transform((tools) => {
+      for (const tool of toolSpecs) tools.add(tool);
+    });
+    disposables.push(() => ctx.tool.reload());
+
+    const skills = await readSkillCatalog(cfg.skillsDir);
+    trace(`tools added=${toolSpecs.length} skills=${skills.length}`);
+    await ctx.skill.transform((editor) => {
+      for (const item of skills) {
+        const id = item.name;
+        if (editor.get(id)) continue;
+        editor.add(
+          Skill.Info.make({
+            id: Skill.ID.make(id),
+            name: Skill.Name.make(item.name),
+            description: item.description || item.name,
+            autoinvoke: true,
+            path: item.file,
+            content: stripFrontmatter(item.raw),
+          }),
+        );
+      }
+    });
+    disposables.push(() => ctx.skill.reload());
+
+    /* ---- 3.7 状态摘要（storage 里的最后一份记录）---- */
+    try {
+      await ctx.storage.set("oc-purge:status", {
+        injectBytes: injectText.length,
+        rules: (await collectRules({ env, options: cfg })).length,
+        scope: scopeReport(cfg.scope),
+        at: Date.now(),
+      });
+    } catch {
+      // 无存储后端时忽略
+    }
+
+    return async () => {
+      for (const dispose of disposables.reverse()) {
+        try {
+          await dispose?.();
+        } catch {
+          // 卸载阶段不抛
+        }
+      }
+    };
+  },
+});
+
+function stripFrontmatter(text) {
+  const raw = String(text || "");
+  if (!raw.startsWith("---")) return raw;
+  const end = raw.indexOf("\n---", 3);
+  if (end === -1) return raw;
+  return raw.slice(raw.indexOf("\n", end + 1) + 1);
+}
+
+/* ------------------------------------------------------------------ *
+ * 4. 新增工具
+ * ------------------------------------------------------------------ */
+
+export function makePurgeTools({ cfg, env }) {
+  const tool = (name, description, input, run) => ({
+    name,
+    options: { codemode: false },
+    description,
+    input,
+    output: Schema.Struct({ text: Schema.String }),
+    execute: async (args, context) => {
+      const text = await run(args || {}, context);
+      return { output: { text }, content: text };
+    },
+  });
+
+  return [
+    tool(
+      "purge_status",
+      "Report oc-purge state: rules, selected card, scope, inject size.",
+      Schema.Struct({}),
+      async () => {
+        const state = readState(env);
+        const rules = listRuleFiles(env).map((r) => `${state.rules.includes(r.id) ? "[x]" : "[ ]"} ${r.id}`);
+        return [
+          `enabled: ${cfg.enabled}`,
+          `rule files: ${rules.length ? rules.join(", ") : "(none)"}`,
+          `workspacePolicy: ${cfg.workspacePolicy}`,
+          `scope: ${JSON.stringify(scopeReport(cfg.scope))}`,
+          `inject: ${readInjectFile(env).length} bytes`,
+        ].join("\n");
+      },
+    ),
+    tool(
+      "purge_rules",
+      "List, add, toggle or remove rule files under $OC_PURGE_HOME/rules.",
+      Schema.Struct({
+        action: Schema.Literals(["list", "add", "toggle", "remove"]),
+        id: Schema.optional(Schema.String),
+        body: Schema.optional(Schema.String),
+      }),
+      async ({ action, id, body }) => {
+        const state = readState(env);
+        ensureDirs(env);
+        if (action === "list") return listRuleFiles(env).map((r) => `${r.id}\t${r.title}\t${r.bytes}B`).join("\n");
+        if (!id) return "error: id required";
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(id)) return `error: invalid id ${id}`;
+        const file = path.join(paths.rules(env), `${id}.md`);
+        if (action === "add") {
+          await fsp.writeFile(file, String(body || `# ${id}\n`), "utf8");
+          if (!state.rules.includes(id)) state.rules.push(id);
+          writeState(env, state);
+          return `added ${id}`;
+        }
+        if (action === "toggle") {
+          state.rules = state.rules.includes(id) ? state.rules.filter((x) => x !== id) : [...state.rules, id];
+          writeState(env, state);
+          return `rules: ${state.rules.join(", ") || "(none)"}`;
+        }
+        if (action === "remove") {
+          await fsp.rm(file, { force: true });
+          state.rules = state.rules.filter((x) => x !== id);
+          writeState(env, state);
+          return `removed ${id}`;
+        }
+        return "noop";
+      },
+    ),
+    tool(
+      "purge_inject",
+      "Read or replace the free-form inject text (prompt-inject.md equivalent).",
+      Schema.Struct({ text: Schema.optional(Schema.String) }),
+      async ({ text }) => {
+        if (typeof text !== "string") return readInjectFile(env);
+        ensureDirs(env);
+        await fsp.writeFile(paths.legacyInject(env), text, "utf8");
+        return `wrote ${text.length} bytes to ${paths.legacyInject(env)} (reload: /oc-purge reload)`;
+      },
+    ),
+    tool(
+      "purge_scope",
+      "Check whether a host is inside the allowed network scope.",
+      Schema.Struct({ host: Schema.String }),
+      async ({ host }) => {
+        const verdict = allowNetwork(cfg.scope, host);
+        return `${verdict.allowed ? "ALLOW" : "DENY"}\t${verdict.reason}\t${host}`;
+      },
+    ),
+  ];
+}
+
+export { agentPatch, applyPromptPatches, DEFAULTS };
+export default plugin;
